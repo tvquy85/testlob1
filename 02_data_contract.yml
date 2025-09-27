@@ -1,0 +1,101 @@
+# 02_data_contract.yml — Data Contract for LOB + OHLCV (Crypto HFT 1s, 2024)
+version: 1.0
+dataset:
+  symbols: ["BTC-USDT", "ETH-USDT"]
+  exchanges: ["BINANCE"]  # extendable
+  year: 2024
+
+time:
+  origin_time:
+    type: timestamp
+    timezone: UTC
+    parse: ISO8601  # e.g., "2024-04-01T12:34:56.789Z" or numeric epoch
+    unit_hint: ms   # if numeric; otherwise parse string automatically
+  received_time:
+    type: timestamp
+    timezone: UTC
+    parse: ISO8601
+    unit_hint: ms
+  clock:
+    primary: origin_time
+    secondary: received_time
+    latency_ms_definition: "latency_ms = received_time - origin_time (in milliseconds)"
+    max_out_of_order_tolerance_ms: 0    # expected non-decreasing origin_time
+    allowed_missing_ratio: 0.0
+
+price_size_schema:
+  levels: 20
+  bid_price_pattern: "bid_{i}_price"   # i in [0..19], 0 is best
+  bid_size_pattern:  "bid_{i}_size"
+  ask_price_pattern: "ask_{i}_price"
+  ask_size_pattern:  "ask_{i}_size"
+  price:
+    unit: USDT
+    dtype: float64
+    decimal_tolerance: 1e-6
+  size:
+    unit: base_asset     # e.g., BTC or ETH
+    dtype: float64
+    decimal_tolerance: 1e-8
+  tick_size:
+    value: 0.01
+    tolerance: 1e-6
+
+other_columns:
+  required: ["sequence_number", "symbol", "exchange"]
+  symbol_format: "BASE-QUOTE"
+  exchange_allowed: ["BINANCE"]
+
+validity_rules:
+  - name: best_bid_less_than_best_ask
+    rule: "bid_0_price < ask_0_price"
+  - name: bid_ladder_descending
+    rule: "bid_i_price >= bid_{i+1}_price for all i in [0..levels-2]"
+  - name: ask_ladder_ascending
+    rule: "ask_i_price <= ask_{i+1}_price for all i in [0..levels-2]"
+  - name: non_negative_sizes
+    rule: "bid_i_size >= 0 and ask_i_size >= 0 for all i"
+  - name: spread_at_least_one_tick
+    rule: "(ask_0_price - bid_0_price) >= tick_size"
+  - name: monotonic_time
+    rule: "origin_time is non-decreasing; received_time >= origin_time"
+  - name: finite_values
+    rule: "no NaN/Inf in time/price/size key fields"
+  - name: sequence_number_monotonic
+    rule: "sequence_number is non-decreasing within a file"
+
+synchronization:
+  anchor_clock: origin_time
+  ohlcv_join:
+    method: nearest
+    tolerance_ms: 500
+  resample_target: 1s
+  higher_timeframes:
+    - 1m
+    - 5m
+    - 15m
+  alignment_rule: "Aggregate/resample from 1s anchor; ensure UTC timezone"
+
+partitioning:
+  file_formats: ["parquet", "csv"]
+  path_templates:
+    - "/data/LOB/{exchange}/{symbol}/year=2024/month={MM}/day={DD}/part-*.parquet"
+    - "/data/LOB/{exchange}/{symbol}/2024/{MM}/{symbol}_{YYYY}-{MM}-{DD}.csv"
+  naming_conventions:
+    symbol: "BTC-USDT | ETH-USDT"
+    date_format: "YYYY-MM-DD"
+    index: "No index column in files; rely on origin_time"
+  integrity:
+    require_single_symbol_per_file: true
+    require_single_exchange_per_file: true
+
+dq_thresholds:
+  max_invalid_spread_ratio: 0.005
+  max_ladder_violation_ratio: 0.01
+  max_negative_size_ratio: 0.0
+  max_nan_ratio: 0.0
+  max_time_backwards_ratio: 0.0
+
+notes:
+  - "Values above thresholds should block backtesting until cleaned."
+  - "Maker fill modeling is approximate without queue position and prints."

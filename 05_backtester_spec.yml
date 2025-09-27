@@ -1,0 +1,51 @@
+# 05_backtester_spec.yml — Event-driven backtester for HFT 1s (LOB + OHLCV)
+version: 1.0
+
+api:
+  run_backtest:
+    signature: "run_backtest(config: dict, data_iter, features_fn, strategy_fn) -> results"
+    arguments:
+      config: "dict chứa 'strategy', 'execution', 'risk', 'output', 'data'"
+      data_iter: "Bộ lặp hoặc DataFrame LOB event-level (có origin_time, bid/ask 0..19)"
+      features_fn: "Callable: (df_lob, ohlcv_1m?, ohlcv_5m?, ohlcv_15m?, params?) -> df_features_1s"
+      strategy_fn: "Callable: (t, row_1s, state, cfg, aux) -> action(s) ; hoặc dùng adapter sẵn trong utils"
+    returns:
+      results: |
+        dict gồm:
+          trades: DataFrame (timestamp, side, qty, px, fee, slippage, reason, run_id)
+          equity_curve: DataFrame (timestamp, equity, pnl, position, gross_exposure)
+          metrics: JSON (Sharpe, Sortino, Calmar, t-stat, Hit-rate, MaxDD, Tail-risk, Turnover, Cost bps, Slippage)
+          logs: list (info/debug events)
+          config_resolved: dict (tham số cuối cùng)
+
+clock_and_data:
+  event_clock: "origin_time (UTC)"
+  compute_features_at: "1s grid (resample) nhưng fills theo event trong [t, t+Δ]"
+  join_ohlcv: "nearest (≤ tolerance_ms) như 03_features_spec.yml"
+
+fills_and_costs:
+  taker:
+    px: "ask_0 (long) / bid_0 (short) tại thời điểm quyết định + slippage"
+    slippage_mode: ["none", "topL_proportional", "microprice_shift"]
+    fees: "taker_bps × notional"
+  maker:
+    quoting: "đặt 2 phía khi spread/ticks >= min_spread_ticks, skew theo OBI/BI/inventory"
+    ttl_ms: "thời hạn lệnh; hết TTL thì huỷ nếu chưa khớp"
+    partial_fills: true
+    fill_model: "topL_depletion_probability: fill_fraction = depletion_topL / (q0 + our_size)"
+    fees: "maker_bps × notional"
+
+risk:
+  controls:
+    - max_gross_exposure (lots)
+    - max_positions (count of open entries)
+    - cooling_time_s (thời gian chờ giữa 2 lệnh cùng chiều)
+    - do_not_trade_windows (hh:mm-hh:mm, UTC)
+
+outputs:
+  per_run:
+    - trades.csv
+    - equity_curve.csv
+    - metrics.json
+    - run.log
+  aggregate: "Có thể tổng hợp nhiều run ở cấp cao hơn"

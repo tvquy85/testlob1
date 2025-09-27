@@ -1,0 +1,113 @@
+# 03_features_spec.yml — Feature Engineering for LOB (HFT 1s)
+version: 1.0
+inputs:
+  lob:
+    required_columns:
+      - origin_time
+      - received_time
+      - sequence_number
+      - symbol
+      - exchange
+    lob_levels: 20
+    bid_price_pattern: "bid_{i}_price"
+    bid_size_pattern:  "bid_{i}_size"
+    ask_price_pattern: "ask_{i}_price"
+    ask_size_pattern:  "ask_{i}_size"
+  ohlcv:
+    optional_timeframes: ["1m", "5m", "15m"]
+    required_columns_per_tf: ["open", "high", "low", "close", "volume"]
+    join_method: nearest
+    join_tolerance_ms: 500
+
+parameters:
+  tick_size: 0.01
+  resample_1s:
+    how:
+      price_like: last   # mid, microprice, spread, microspread, OBI_L, BI
+      ofi: sum           # aggregate OFI events to 1s
+      vacuum: max        # take max drop within each second
+      momentum: mean     # average intra-second Δ
+    ffill_limit_seconds: 1
+  obi_levels: [1, 3, 5, 10, 20]
+  ofi_levels: [1, 3, 5]
+  ofi_zscore_window_seconds: 60
+  liquidity_windows:
+    - 500ms
+    - 1s
+  momentum_windows_ms: [250, 500, 1000]
+  realized_vol:
+    lookbacks:
+      "1m": [20, 50]
+      "5m": [20, 50]
+      "15m": [20, 50]
+    definition: "RV = rolling sum of squared log returns of close"
+  ema:
+    periods:
+      "1m": [20, 50]
+      "5m": [20, 50]
+      "15m": [20, 50]
+  trend_filter: "EMA(20) > EMA(50) per timeframe"
+
+features:
+  basic:
+    - mid = (bid_0_price + ask_0_price) / 2
+    - spread = ask_0_price - bid_0_price
+    - microprice = (ask_0_price*bid_0_size + bid_0_price*ask_0_size) / (bid_0_size + ask_0_size)
+    - microspread = microprice - mid
+  depth_and_imbalance:
+    depth_bid_L = sum_{i=0..L-1} bid_i_size
+    depth_ask_L = sum_{i=0..L-1} ask_i_size
+    OBI_L = (depth_bid_L - depth_ask_L) / (depth_bid_L + depth_ask_L)   # L ∈ obi_levels
+    BI = bid_0_size / (bid_0_size + ask_0_size)
+  ofi_event:
+    definition: |
+      For each level i,
+      ΔW_b(i) = 1[p_b^t > p_b^{t-1}] * q_b^t - 1[p_b^t < p_b^{t-1}] * q_b^{t-1} + 1[p_b^t = p_b^{t-1}] * (q_b^t - q_b^{t-1})
+      ΔW_a(i) = 1[p_a^t < p_a^{t-1}] * q_a^t - 1[p_a^t > p_a^{t-1}] * q_a^{t-1} + 1[p_a^t = p_a^{t-1}] * (q_a^t - q_a^{t-1})
+      OFI_L(event) = Σ_{i=0..L-1} (ΔW_b(i) - ΔW_a(i))
+    resample: sum to 1s
+    zscore: rolling window = ofi_zscore_window_seconds
+  liquidity_vacuum:
+    definition: |
+      For each L and window Δt ∈ {500ms,1s},
+      drop_bid_L(Δt) = (rolling_max(depth_bid_L, Δt) - depth_bid_L_now) / rolling_max
+      drop_ask_L(Δt) = (rolling_max(depth_ask_L, Δt) - depth_ask_L_now) / rolling_max
+      Also compute rate-of-change: roc_bid_L(Δt) = (depth_bid_L_now - depth_bid_L_{t-Δt}) / depth_bid_L_{t-Δt} (and ask).
+    resample: max within 1s for drop_*, mean for roc_*
+  micro_momentum:
+    definition: |
+      Δmid(δ) = mid_now - mid_{t-δ},  δ ∈ {250ms, 500ms, 1s}
+      Δmicroprice(δ) = microprice_now - microprice_{t-δ}
+    resample: average within 1s
+  multi_timeframe_ohlcv:
+    ema: EMA(20), EMA(50) on close for 1m/5m/15m
+    rv: realized volatility on close for the same TFs
+    trend: trend_tf = 1[EMA20 > EMA50]
+    join: align to 1s via nearest (≤ join_tolerance_ms), forward-fill otherwise
+
+targets:
+  horizons_seconds: [1, 2, 3]
+  returns:
+    definition: "r_h = log(mid_{t+h} / mid_t)"
+    columns: ["target_r_1s", "target_r_2s", "target_r_3s"]
+  classification:
+    definition: "sign(r_h) ∈ {-1,0,1}"
+    columns: ["target_c_1s", "target_c_2s", "target_c_3s"]
+
+output_schema:
+  index: DatetimeIndex[UTC], freq=1s
+  columns:
+    - mid: float64
+    - spread: float64
+    - microprice: float64
+    - microspread: float64
+    - BI: float64
+    - {for L in [1,3,5,10,20]}: depth_bid_L{L}, depth_ask_L{L}, OBI_L{L}  # float64
+    - {for L in [1,3,5]}: ofi_L{L}_1s, ofi_L{L}_z_60s                      # float64
+    - {for L in [1,3,5,10,20], Δ in [0p5s,1s]}: vac_bid_L{L}_Δ, vac_ask_L{L}_Δ  # float64 in [0,1]
+    - {for Δ in [250ms,500ms,1s]}: dmid_Δ, dmicro_Δ                         # float64
+    - ema_1m_20, ema_1m_50, rv_1m_20, rv_1m_50, trend_1m                    # float64,int
+    - ema_5m_20, ema_5m_50, rv_5m_20, rv_5m_50, trend_5m                    # float64,int
+    - ema_15m_20, ema_15m_50, rv_15m_20, rv_15m_50, trend_15m               # float64,int
+    - target_r_1s, target_r_2s, target_r_3s                                 # float64
+    - target_c_1s, target_c_2s, target_c_3s                                 # int8

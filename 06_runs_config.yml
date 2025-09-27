@@ -1,0 +1,147 @@
+# 06_runs_config.yml — Experiment plan for HFT 1s (LOB + OHLCV), BTC/USDT & ETH/USDT, year 2024
+version: 1.0
+project: "HFT_1s_LOB_2024"
+artifacts:
+  features_spec: "/mnt/data/03_features_spec.yml"
+  alphas_spec:   "/mnt/data/04_alphas_spec.yml"
+  backtester_spec: "/mnt/data/05_backtester_spec.yml"
+
+dataset:
+  exchange: "BINANCE"
+  symbols: ["BTC-USDT", "ETH-USDT"]
+  year: 2024
+  # Adjust paths to your data layout. You can use multiple patterns per symbol.
+  paths:
+    BTC-USDT:
+      - "/data/LOB/BINANCE/BTC-USDT/2024/**/*.csv"
+      - "/data/LOB/BINANCE/BTC-USDT/2024/**/*.parquet"
+    ETH-USDT:
+      - "/data/LOB/BINANCE/ETH-USDT/2024/**/*.csv"
+      - "/data/LOB/BINANCE/ETH-USDT/2024/**/*.parquet"
+  ohlcv_paths:
+    "1m":  "/data/OHLCV/BINANCE/{symbol}/1m/2024/*.parquet"
+    "5m":  "/data/OHLCV/BINANCE/{symbol}/5m/2024/*.parquet"
+    "15m": "/data/OHLCV/BINANCE/{symbol}/15m/2024/*.parquet"
+
+splits:
+  quarters:
+    Q1: {start: "2024-01-01", end: "2024-03-31"}
+    Q2: {start: "2024-04-01", end: "2024-06-30"}
+    Q3: {start: "2024-07-01", end: "2024-09-30"}
+    Q4: {start: "2024-10-01", end: "2024-12-31"}
+  # A few rolling quarterly schemes; you may subset which to run.
+  schemes:
+    - name: "RS1_Q1_train_Q2_val_Q3_test"
+      train: ["Q1"]
+      val:   ["Q2"]
+      test:  ["Q3"]
+    - name: "RS2_Q2_train_Q3_val_Q4_test"
+      train: ["Q2"]
+      val:   ["Q3"]
+      test:  ["Q4"]
+    - name: "RS3_Q1Q2_train_Q3_val_Q4_test"
+      train: ["Q1","Q2"]
+      val:   ["Q3"]
+      test:  ["Q4"]
+    - name: "RS4_Q1_train_Q2Q3_val_Q4_test"
+      train: ["Q1"]
+      val:   ["Q2","Q3"]
+      test:  ["Q4"]
+
+cv:
+  intra_month:
+    type: "kfold"
+    k_folds: 5
+    purging_days: 3
+    embargo_days: 1
+    shuffle: false
+    seed: 42
+
+# Global execution & risk defaults; experiment-level overrides are allowed
+defaults:
+  initial_equity: 100000.0
+  execution:
+    slippage_mode: "topL_proportional"
+    slippage_L: 3
+    taker_bps: 8
+    maker_bps: 2
+    latency_ms: 50
+    TTL_ms: 500
+  risk:
+    max_gross_exposure: 3.0
+    max_positions: 3
+    cooling_time_s: 1.0
+    do_not_trade_windows: []   # e.g. ["00:00-00:02", "23:58-23:59"]
+
+# Cost scenarios to cross with each experiment
+cost_grid:
+  taker_bps:  [5, 10]
+  maker_bps:  [1, 5]
+  latency_ms: [0, 50, 100]
+
+experiments:
+
+  - name: "A_OFI_breakout"
+    strategy_key: "A_OFI_breakout"
+    grid:
+      L:     [3, 5, 10]
+      z_up:  [1.5, 2.0, 2.5]
+      lambda: [0.2, 0.4]
+      tp_sl_pairs:
+        - {k_tp: 2.0, k_sl: 1.5}
+        - {k_tp: 3.0, k_sl: 2.0}
+
+  - name: "B_Microprice_MR"
+    strategy_key: "B_Microprice_MR"
+    grid:
+      tau_pairs:
+        - {tau_high: 0.6, tau_low: 0.6}
+        - {tau_high: 0.8, tau_low: 0.8}
+      S_max_ticks: [1, 2]
+      tp_sl: {k_tp: 1.5, k_sl: 1.0}
+      T_max_s: [2.0, 3.0]
+
+  - name: "C_LiquidityVacuum"
+    strategy_key: "C_Liquidity_Vacuum"
+    grid:
+      L: [3, 5]
+      x_pct: [0.30, 0.50]   # 30%, 50%
+      y_mult: [1.0, 2.0]    # Δmid >= y*spread
+      tp_sl_recov:
+        - {m_tp: 2.0, n_sl: 1.5, recovery_pct: 0.4}
+        - {m_tp: 3.0, n_sl: 2.0, recovery_pct: 0.4}
+      T_max_s: [2.0]
+
+  - name: "D_Maker_Skewed_MM"
+    strategy_key: "D_Maker_Skewed_MM"
+    grid:
+      TTL_ms: [250, 500, 1000]
+      inventory_limit: [1, 2, 3]
+      base_offset_ticks: [1.0]
+      gamma_OBI: [0.8]
+      gamma_BI: [0.5]
+      gamma_inv: [0.3]
+      min_spread_ticks: [2]
+
+# Cross-product plan
+plan:
+  symbols: ["BTC-USDT", "ETH-USDT"]
+  split_schemes: ["RS1_Q1_train_Q2_val_Q3_test", "RS2_Q2_train_Q3_val_Q4_test", "RS3_Q1Q2_train_Q3_val_Q4_test", "RS4_Q1_train_Q2Q3_val_Q4_test"]
+  experiments: ["A_OFI_breakout", "B_Microprice_MR", "C_LiquidityVacuum", "D_Maker_Skewed_MM"]
+  cost_scenarios:
+    taker_bps:  [5, 10]
+    maker_bps:  [1, 5]
+    latency_ms: [0, 50, 100]
+  filters:
+    # Multi-timeframe filters applied globally (same semantics as in 04_alphas_spec.yml defaults)
+    long_only_when_trend_1m: true
+    restrict_short_in_low_vol: true
+
+output:
+  base_dir: "./runs_out"
+  per_run:
+    save: ["trades.csv", "equity_curve.csv", "metrics.json", "TEARSHEET.html", "run.log"]
+    tearsheet: true
+  run_dir_pattern: "{symbol}/{scheme}/{experiment}/{grid_id}/cost_{taker_bps}tbps_{maker_bps}mbps_lat{latency_ms}ms"
+  # Optional: limit total combinations (debug)
+  max_runs: null

@@ -1,0 +1,244 @@
+# 04_alphas_spec.yml — Strategy specs (A–D) for HFT 1s using LOB + OHLCV
+version: 1.0
+tick_size: 0.01
+
+execution_enums:
+  slippage_mode: ["none", "topL_proportional", "microprice_shift"]
+
+defaults:
+  multi_timeframe_filters:
+    long_only_when_trend_1m: true
+    trend_1m_expr: "ema_1m_20 > ema_1m_50"   # column names from features.py
+    restrict_short_in_low_vol: true
+    low_vol_expr: "(rv_1m_20 < rv_1m_50) or ((spread / 0.01) <= 1)"  # spread<=1 tick or RV downtrend
+  execution:
+    taker_bps: 8
+    maker_bps: 2
+    slippage_mode: "topL_proportional"
+    slippage_L: 3
+    latency_ms: 50
+  risk:
+    max_gross_exposure: 3.0         # in lots (abstract units)
+    max_positions: 3
+    cooling_time_s: 1.0
+    do_not_trade_windows: []        # e.g. ["00:00-00:02", "23:58-23:59"]
+
+strategies:
+
+  A_OFI_breakout:
+    role: taker
+    description: >
+      Breakout theo OFI (z-score) + điều kiện microprice lệch cùng chiều, có filter đa khung.
+    inputs:
+      features:
+        - "ofi_L{L}_z_60s"
+        - "microprice"
+        - "mid"
+        - "spread"
+        - "OBI_L{L}"
+        - "ema_1m_20"
+        - "ema_1m_50"
+        - "rv_1m_20"
+        - "rv_1m_50"
+      params:
+        L: 3             # OFI levels {1,3,5}
+        z_up: 2.0        # entry threshold on zscore
+        lambda: 0.3      # microprice-mid bias vs spread
+        k_tp: 2.0        # TP multiple of spread_at_entry
+        k_sl: 1.5        # SL multiple of spread_at_entry
+        T_max_s: 2.0     # time stop in seconds
+        allow_reverse_on_signal: true
+    signal_logic:
+      entry_long: >
+        (ofi_L{L}_z_60s > z_up) and ((microprice - mid) > lambda * spread)
+        and ({trend_1m}) and (not ({low_vol}) or restrict_short_in_low_vol==false)
+      entry_short: >
+        (ofi_L{L}_z_60s < -z_up) and ((mid - microprice) > lambda * spread)
+        and (({trend_1m})==false) and (not ({low_vol}) or restrict_short_in_low_vol==false)
+      exits:
+        take_profit_ticks: "k_tp * (spread / 0.01)"
+        stop_loss_ticks:   "k_sl * (spread / 0.01)"
+        time_stop_s: "T_max_s"
+        reverse_on_signal: "allow_reverse_on_signal"
+    execution: { }
+    risk: { }
+
+  B_Microprice_MR:
+    role: taker
+    description: >
+      Mean-reversion dựa trên độ lệch microprice so với mid theo đơn vị spread; vào lệnh khi s vượt ngưỡng và spread không quá rộng.
+    inputs:
+      features:
+        - "microprice"
+        - "mid"
+        - "spread"
+        - "ema_1m_20"
+        - "ema_1m_50"
+        - "rv_1m_20"
+        - "rv_1m_50"
+      params:
+        tau_high: 0.8    # threshold for short
+        tau_low: 0.8     # threshold for long (absolute)
+        tau_exit: 0.2    # exit band
+        S_max: 2         # max spread in ticks
+        k_tp: 1.5
+        k_sl: 1.0
+        T_max_s: 3.0
+    derived:
+      s_expr: "(microprice - mid) / max(spread, 0.01)"   # normalized bias by spread
+      spread_ticks_expr: "spread / 0.01"
+    signal_logic:
+      entry_long: >
+        ({s}) < -tau_low and (({spread_ticks}) <= S_max) and ({trend_1m})
+      entry_short: >
+        ({s}) >  tau_high and (({spread_ticks}) <= S_max) and (({trend_1m})==false) and (not ({low_vol}) or restrict_short_in_low_vol==false)
+      exits:
+        exit_band: "|{s}| <= tau_exit"
+        take_profit_ticks: "k_tp * (spread / 0.01)"
+        stop_loss_ticks:   "k_sl * (spread / 0.01)"
+        time_stop_s: "T_max_s"
+    execution: { }
+    risk: { }
+
+  C_Liquidity_Vacuum:
+    role: taker
+    description: >
+      Khai thác sụt giảm depth nhanh (vacuum) + chuyển động giá; xác nhận bằng OBI_L.
+    inputs:
+      features:
+        - "vac_ask_L{L}_0p5s"
+        - "vac_ask_L{L}_1s"
+        - "vac_bid_L{L}_0p5s"
+        - "vac_bid_L{L}_1s"
+        - "dmid_1s"
+        - "spread"
+        - "OBI_L{L}"
+        - "ema_1m_20"
+        - "ema_1m_50"
+        - "rv_1m_20"
+        - "rv_1m_50"
+      params:
+        L: 5
+        x_pct: 0.5    # drop threshold (e.g., 0.5 = 50%)
+        y_mult: 1.0   # dmid_1s >= y * spread
+        m_tp: 2.0
+        n_sl: 1.5
+        T_max_s: 2.0
+        recovery_pct: 0.4  # exit if depth recovers by 40%
+    derived:
+      vac_ask_max_expr: "max(vac_ask_L{L}_0p5s, vac_ask_L{L}_1s)"
+      vac_bid_max_expr: "max(vac_bid_L{L}_0p5s, vac_bid_L{L}_1s)"
+    signal_logic:
+      entry_long: >
+        ({vac_ask_max}) >= x_pct and (dmid_1s >= y_mult * spread) and (OBI_L{L} > 0) and ({trend_1m})
+      entry_short: >
+        ({vac_bid_max}) >= x_pct and (-dmid_1s >= y_mult * spread) and (OBI_L{L} < 0) and (({trend_1m})==false) and (not ({low_vol}) or restrict_short_in_low_vol==false)
+      exits:
+        take_profit_ticks: "m_tp * (spread / 0.01)"
+        stop_loss_ticks:   "n_sl * (spread / 0.01)"
+        time_stop_s: "T_max_s"
+        depth_recovery_exit: "vac_ask_L{L}_1s < recovery_pct for long; vac_bid_L{L}_1s < recovery_pct for short"
+    execution: { }
+    risk: { }
+
+  D_Maker_Skewed_MM:
+    role: maker
+    description: >
+      Market making 2 phía với skew dựa trên OBI/BI/inventory; TTL ngắn; fill xấp xỉ theo depletion top-of-book.
+    inputs:
+      features:
+        - "mid"
+        - "spread"
+        - "OBI_L{L}"
+        - "BI"
+        - "ofi_L{L}_z_60s"
+        - "ema_1m_20"
+        - "ema_1m_50"
+        - "rv_1m_20"
+        - "rv_1m_50"
+      params:
+        L: 3
+        base_offset_ticks: 1.0     # quote distance from mid on each side when no skew
+        gamma_OBI: 0.8             # skew sensitivity to OBI
+        gamma_BI: 0.5              # skew sensitivity to BI-0.5
+        gamma_inv: 0.3             # skew sensitivity to inventory
+        min_spread_ticks: 2        # require spread >= 2 ticks to quote both sides
+        TTL_ms: 500
+        inventory_limit: 2         # lots
+        target_inventory: 0
+        cancel_on_spread_shrink: true
+        cancel_on_ofi_flip_z: 1.5  # cancel/refresh if |ofi_z|>1.5 and sign flips vs side
+    quoting:
+      when: "spread/0.01 >= min_spread_ticks and ({trend_1m} or allow_contra_trend==false)"
+      bid_quote_price: "mid - (base_offset_ticks - skew_ticks)*0.01"
+      ask_quote_price: "mid + (base_offset_ticks + skew_ticks)*0.01"
+      skew_ticks: "gamma_OBI*OBI_L{L} + gamma_BI*(BI-0.5) + gamma_inv*inventory"
+      ttl_ms: "TTL_ms"
+      cancel_conditions:
+        - "spread/0.01 < min_spread_ticks"
+        - "abs(ofi_L{L}_z_60s) >= cancel_on_ofi_flip_z"
+        - "cancel_on_spread_shrink and spread decreased since quote"
+      end_of_block_flatten_s: 1.0
+    execution:
+      maker_bps: 2
+      taker_bps: 8
+      slippage_mode: "topL_proportional"
+      slippage_L: 1
+      maker_fill_model: "topL_depletion_probability"
+      latency_ms: 50
+      partial_fills: true
+    risk:
+      max_gross_exposure: 3.0
+      max_positions: 2
+      cooling_time_s: 0.5
+      do_not_trade_windows: []
+
+# Expression placeholders expanded by backtester:
+expr_placeholders:
+  trend_1m: "ema_1m_20 > ema_1m_50"
+  low_vol: "(rv_1m_20 < rv_1m_50) or ((spread / 0.01) <= 1)"
+  s: "(microprice - mid) / max(spread, 0.01)"
+  spread_ticks: "spread / 0.01"
+  vac_ask_max: "max(vac_ask_L{L}_0p5s, vac_ask_L{L}_1s)"
+  vac_bid_max: "max(vac_bid_L{L}_0p5s, vac_bid_L{L}_1s)"
+
+presets:
+  A_OFI_breakout:
+    - name: "A1_L3_fast"
+      params: {L: 3, z_up: 1.5, lambda: 0.2, k_tp: 2.0, k_sl: 1.5, T_max_s: 2.0}
+      execution: {taker_bps: 8, slippage_mode: "topL_proportional", slippage_L: 3, latency_ms: 50}
+    - name: "A2_L5_balanced"
+      params: {L: 5, z_up: 2.0, lambda: 0.3, k_tp: 2.0, k_sl: 1.5, T_max_s: 2.0}
+      execution: {taker_bps: 5, slippage_mode: "topL_proportional", slippage_L: 3, latency_ms: 50}
+    - name: "A3_L10_strict"
+      params: {L: 10, z_up: 2.5, lambda: 0.4, k_tp: 3.0, k_sl: 2.0, T_max_s: 2.0}
+      execution: {taker_bps: 10, slippage_mode: "microprice_shift", latency_ms: 100}
+
+  B_Microprice_MR:
+    - name: "B1_tight_spread_1tick"
+      params: {tau_high: 0.6, tau_low: 0.6, tau_exit: 0.2, S_max: 1, k_tp: 1.5, k_sl: 1.0, T_max_s: 2.0}
+      execution: {taker_bps: 8, slippage_mode: "topL_proportional", slippage_L: 1, latency_ms: 50}
+    - name: "B2_symmetric_2ticks"
+      params: {tau_high: 0.8, tau_low: 0.8, tau_exit: 0.2, S_max: 2, k_tp: 1.5, k_sl: 1.0, T_max_s: 3.0}
+      execution: {taker_bps: 5, slippage_mode: "topL_proportional", slippage_L: 3, latency_ms: 50}
+    - name: "B3_conservative"
+      params: {tau_high: 1.0, tau_low: 1.0, tau_exit: 0.3, S_max: 2, k_tp: 1.2, k_sl: 0.8, T_max_s: 3.0}
+      execution: {taker_bps: 10, slippage_mode: "microprice_shift", latency_ms: 100}
+
+  C_Liquidity_Vacuum:
+    - name: "C1_L3_x30_y1"
+      params: {L: 3, x_pct: 0.30, y_mult: 1.0, m_tp: 2.0, n_sl: 1.5, T_max_s: 2.0, recovery_pct: 0.4}
+      execution: {taker_bps: 8, slippage_mode: "topL_proportional", slippage_L: 3, latency_ms: 50}
+    - name: "C2_L5_x50_y1"
+      params: {L: 5, x_pct: 0.50, y_mult: 1.0, m_tp: 2.0, n_sl: 1.5, T_max_s: 2.0, recovery_pct: 0.4}
+      execution: {taker_bps: 5, slippage_mode: "topL_proportional", slippage_L: 3, latency_ms: 50}
+    - name: "C3_L5_x50_y2"
+      params: {L: 5, x_pct: 0.50, y_mult: 2.0, m_tp: 3.0, n_sl: 2.0, T_max_s: 2.0, recovery_pct: 0.4}
+      execution: {taker_bps: 10, slippage_mode: "microprice_shift", latency_ms: 100}
+
+  D_Maker_Skewed_MM:
+    - name: "D1_L3_TTL500ms_inv2"
+      params: {L: 3, base_offset_ticks: 1.0, gamma_OBI: 0.8, gamma_BI: 0.5, gamma_inv: 0.3,
+               min_spread_ticks: 2, TTL_ms: 500, inventory_limit: 2, target_inventory: 0,
+               cancel_on_spread_shrink: true, cancel_on_ofi_flip_z: 1.5}
+      execution: {maker_bps: 2, slippage_mode: "topL_proportional", slippage_L: 1, latency_ms: 50, partial_fills: true}
